@@ -1,10 +1,8 @@
-// Paste your Firebase web app settings between the quotes (README.md, step 5).
-// These values are not secrets. The database rules protect your data.
 window.BREAK_BOARD_CONFIG = {
   firebase: {
-    apiKey: "PASTE_API_KEY",
-    authDomain: "PASTE_PROJECT_ID.firebaseapp.com",
-    projectId: "PASTE_PROJECT_ID",
-    appId: "PASTE_APP_ID"
+    apiKey: "AIzaSyCdW9RM_W69PIPyD0aHDNvn3NOBuU90iPE",
+    authDomain: "staff-login-538c3.firebaseapp.com",
+    projectId: "staff-login-538c3",
+    appId: "1:897989558039:web:7a42eb5ac9f00a85790152"
   }
 };
