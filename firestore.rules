@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Replace with your admin email(s), in lowercase.
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.email in ['YOUR_ADMIN_EMAIL@example.com'];
+    }
+
+    // Staff names and break types: everyone reads, only admins change.
+    match /staff/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /config/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Breaks happening now (or scheduled): the board needs everyone to see these.
+    match /live/{id} {
+      allow read: if true;
+      allow create, update: if request.resource.data.keys().hasOnly(['staffId','staffName','type','allowed','start'])
+        && request.resource.data.staffId == id
+        && request.resource.data.allowed is number
+        && request.resource.data.start is number;
+      allow delete: if true;
+    }
+
+    // Finished breaks (the log): anyone can add one, only admins can read or remove.
+    match /breaks/{id} {
+      allow create: if request.resource.data.keys().hasOnly(['staffId','staffName','type','allowed','start','end'])
+        && request.resource.data.start is number
+        && request.resource.data.end is number
+        && request.resource.data.end >= request.resource.data.start;
+      allow read, delete: if isAdmin();
+      allow update: if false;
+    }
+  }
+}
