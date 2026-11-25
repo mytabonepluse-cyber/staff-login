@@ -2,40 +2,65 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Replace with your admin email(s), in lowercase.
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Admin emails, in lowercase. Add more like ['a@x.com','b@x.com'].
     function isAdmin() {
-      return request.auth != null
-        && request.auth.token.email in ['YOUR_ADMIN_EMAIL@example.com'];
+      return signedIn()
+        && request.auth.token.email in ['mytabonepluse@gmail.com'];
     }
 
-    // Staff names and break types: everyone reads, only admins change.
+    // Staff sign in as USERNAME@breakboard.example.com (created from the Setup tab).
+    function isMe(id) {
+      return signedIn()
+        && request.auth.token.email == id + '@breakboard.example.com';
+    }
+
+    function staffExists(id) {
+      return exists(/databases/$(database)/documents/staff/$(id));
+    }
+
+    // Staff list: admin sees everyone, a staff member sees only their own entry.
     match /staff/{id} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-    match /config/{id} {
-      allow read: if true;
+      allow read: if isAdmin() || isMe(id);
       allow write: if isAdmin();
     }
 
-    // Breaks happening now (or scheduled): the board needs everyone to see these.
+    // Break types: any signed-in user reads, only admin changes.
+    match /config/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Break in progress (or scheduled): one entry per staff member.
     match /live/{id} {
-      allow read: if true;
-      allow create, update: if request.resource.data.keys().hasOnly(['staffId','staffName','type','allowed','start'])
+      allow read: if isAdmin() || isMe(id);
+      allow create, update: if (isAdmin() || (isMe(id) && staffExists(id)))
+        && request.resource.data.keys().hasOnly(['staffId','staffName','type','allowed','start'])
         && request.resource.data.staffId == id
         && request.resource.data.allowed is number
         && request.resource.data.start is number;
-      allow delete: if true;
+      allow delete: if isAdmin() || isMe(id);
     }
 
-    // Finished breaks (the log): anyone can add one, only admins can read or remove.
+    // Finished breaks (the log): staff add and read their own, admin reads and removes all.
     match /breaks/{id} {
-      allow create: if request.resource.data.keys().hasOnly(['staffId','staffName','type','allowed','start','end'])
+      allow create: if (isAdmin() || (isMe(request.resource.data.staffId) && staffExists(request.resource.data.staffId)))
+        && request.resource.data.keys().hasOnly(['staffId','staffName','email','type','allowed','start','end'])
+        && request.resource.data.email == request.resource.data.staffId + '@breakboard.example.com'
         && request.resource.data.start is number
         && request.resource.data.end is number
         && request.resource.data.end >= request.resource.data.start;
-      allow read, delete: if isAdmin();
-      allow update: if false;
+      allow read: if isAdmin()
+        || (signedIn() && resource.data.email == request.auth.token.email);
+      allow delete: if isAdmin();
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['staffId','staffName','email','type','allowed','start','end'])
+        && request.resource.data.start is number
+        && request.resource.data.end is number
+        && request.resource.data.end >= request.resource.data.start;
     }
   }
 }
