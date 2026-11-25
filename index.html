@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Break Board</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&family=Space+Grotesk:wght@500;600;700&display=swap">
+<script>try{var __t=localStorage.getItem("bb-theme");if(__t==="light")document.documentElement.setAttribute("data-theme","light");else if(__t!=="auto")document.documentElement.setAttribute("data-theme","dark")}catch(e){document.documentElement.setAttribute("data-theme","dark")}</script>
 <style>
 :root{
   color-scheme:light;
@@ -16,12 +17,18 @@
   --font-mono:'JetBrains Mono',ui-monospace,Menlo,monospace;
 }
 @media (prefers-color-scheme: dark){
-  :root{
+  :root:not([data-theme="light"]){
     color-scheme:dark;
     --bg:#0E1A1D; --surface:#16272B; --ink:#E6EFEE; --muted:#93A8AC; --line:#2A3F44;
     --accent:#4FC1BE; --accent-ink:#06201F; --on-bg:#14383A;
     --ok:#6FD3A0; --ok-bg:#16362A; --warn:#F2C45A; --warn-bg:#3A2F10; --bad:#FF8A80; --bad-bg:#43201D;
   }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0E1A1D; --surface:#16272B; --ink:#E6EFEE; --muted:#93A8AC; --line:#2A3F44;
+  --accent:#4FC1BE; --accent-ink:#06201F; --on-bg:#14383A;
+  --ok:#6FD3A0; --ok-bg:#16362A; --warn:#F2C45A; --warn-bg:#3A2F10; --bad:#FF8A80; --bad-bg:#43201D;
 }
 *{box-sizing:border-box}
 html{font-family:var(--font-body)}
@@ -112,6 +119,16 @@ tr.total td{font-weight:600;border-bottom:0;background:var(--bg)}
 .cred{background:var(--ok-bg);border:1px solid var(--ok);border-radius:10px;padding:12px 14px;margin:0 0 12px}
 .cred b{font-family:var(--font-mono)}
 textarea{font:inherit;font-family:var(--font-mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;width:100%;box-sizing:border-box;min-height:120px}
+.bars{display:flex;flex-direction:column;gap:8px}
+.brow{display:grid;grid-template-columns:minmax(70px,110px) minmax(0,1fr) auto;gap:8px;align-items:center;font-size:.9rem}
+.bar{height:14px;background:var(--line);border-radius:7px;overflow:hidden;display:flex}
+.bar i{display:block;height:100%}
+.bar .a{background:var(--accent)}
+.bar .o{background:var(--bad)}
+.legend{display:flex;gap:14px;font-size:.8rem;color:var(--muted)}
+.legend b{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.typerow{grid-template-columns:minmax(0,1fr) 84px 84px auto !important}
+.tr-lab{font-size:.75rem;color:var(--muted)}
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -140,11 +157,21 @@ var subs=[];
 var tab='board',picking=null,customFor=null,customMin='',startAt='',busy={},confirmId=null,typeDraft=null;
 var toastMsg='',toastTimer=null,loadTimer=null;
 var loginUser='',loginPass='',loginErr='';
-var showPin=false,newPin='';var bulkText='',bulkRes=null,popup=null,alerted={},newCred=null,audioCtx=null;
+var showPin=false,newPin='';var maxAtOnce=0,atOnceDraft=null,editId=null,editStart='',editEnd='',theme='dark',bulkText='',bulkRes=null,popup=null,alerted={},newCred=null,audioCtx=null;
 var addName='',addUser='',addPin='';
 var today=dayKey(Date.now());
 var range={from:today,to:today};
 
+function applyTheme(){
+  var r=document.documentElement;
+  if(theme==='auto')r.removeAttribute('data-theme');else r.setAttribute('data-theme',theme);
+}
+function loadTheme(){try{var t=localStorage.getItem('bb-theme');if(t==='light'||t==='auto'||t==='dark')theme=t}catch(e){}applyTheme()}
+function cycleTheme(){
+  theme=theme==='dark'?'light':theme==='light'?'auto':'dark';
+  try{localStorage.setItem('bb-theme',theme)}catch(e){}
+  applyTheme();render();
+}
 function pad(n){return String(n).padStart(2,'0')}
 function dayKey(ms){var d=new Date(ms);return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())}
 function clock(sec){sec=Math.max(0,Math.floor(sec));var hh=Math.floor(sec/3600),mm=Math.floor(sec%3600/60),ss=sec%60;return hh?hh+':'+pad(mm)+':'+pad(ss):pad(mm)+':'+pad(ss)}
@@ -180,6 +207,7 @@ function errMsg(e){
   if(c==='auth/network-request-failed')return 'No connection. Try again.';
   return 'Something went wrong. Try again.';
 }
+function forgot(o){return o.end==null&&o.start<=Date.now()&&(Date.now()-o.start)/60000-o.allowed>=60}
 function openFor(id){for(var i=0;i<live.length;i++){if(live[i].staffId===id)return live[i]}return null}
 function todayStats(id){var n=0,t=0;breaks.forEach(function(b){if(b.staffId===id&&dayKey(b.start)===today){n++;t+=dur(b)}});return{n:n,t:t}}
 function nameOf(b){for(var i=0;i<staff.length;i++){if(staff[i].id===b.staffId)return staff[i].name}return b.staffName||'Removed staff'}
@@ -201,21 +229,25 @@ function beep(){
 }
 function checkAlerts(){
   if(!user||!authReady)return;
-  var now=Date.now(),fresh=[];
+  var now=Date.now(),fresh=[],anyOver=false;
   live.forEach(function(o){
     if(o.start>now)return;
-    var over=now-o.start-o.allowed*60000;
-    if(over<0)return;
-    var key=o.id+':'+o.start,last=alerted[key];
-    if(last&&now-last<5*60000)return;
-    alerted[key]=now;
-    var mins=Math.max(1,Math.floor(over/60000));
-    var who=nameOf(o);
-    fresh.push(isAdmin?(who+' is over time on '+o.type+' (over by '+(over<60000?'under 1':mins)+' min).')
-      :('Your '+o.type+' break is over time (over by '+(over<60000?'under 1':mins)+' min). Please end your break.'));
+    var used=now-o.start,limit=o.allowed*60000,over=used-limit,key=o.id+':'+o.start;
+    if(over>=0){
+      var last=alerted[key];
+      if(last&&now-last<5*60000)return;
+      alerted[key]=now;anyOver=true;
+      var mins=Math.max(1,Math.floor(over/60000)),who=nameOf(o);
+      fresh.push(isAdmin?(who+' is over time on '+o.type+' (over by '+(over<60000?'under 1':mins)+' min).')
+        :('Your '+o.type+' break is over time (over by '+(over<60000?'under 1':mins)+' min). Please end your break.'));
+    }else if(!isAdmin&&o.allowed>=3&&limit-used<=120000&&!alerted[key+':w']){
+      alerted[key+':w']=now;
+      fresh.push('Your '+o.type+' break ends in 2 minutes. Please wrap up.');
+    }
   });
   if(!fresh.length)return;
-  popup=(popup||[]).concat(fresh);
+  popup=popup||{items:[],over:false};
+  popup.items=popup.items.concat(fresh);popup.over=popup.over||anyOver;
   beep();render();
 }
 
@@ -236,6 +268,10 @@ function startBreak(s,t){
   if(st===null){toast('Pick a start time that has not passed yet.');return}
   guard('s'+s.id,function(){
     if(openFor(s.id))return;
+    if(t.max>0){
+      var c=0;breaks.forEach(function(b){if(b.staffId===s.id&&b.type===t.name&&dayKey(b.start)===today)c++});
+      if(c>=t.max){toast(t.name+' limit reached: '+t.max+' per day.');return}
+    }
     picking=null;customFor=null;customMin='';startAt='';
     return fs.collection('live').doc(s.id).set({staffId:s.id,staffName:s.name,type:t.name,allowed:t.allowed,start:st});
   });
@@ -247,6 +283,16 @@ function endBreak(b){
     batch.set(fs.collection('breaks').doc(),{staffId:b.staffId,staffName:b.staffName||'',email:emailFor(b.staffId),type:b.type,allowed:b.allowed,start:b.start,end:end});
     batch.delete(fs.collection('live').doc(b.id));
     return batch.commit().then(function(){toast('Break recorded for '+nameOf(b)+'.')});
+  });
+}
+function saveEdit(b){
+  var p=dayKey(b.start).split('-'),a=editStart.split(':'),z=editEnd.split(':');
+  if(a.length<2||z.length<2){toast('Enter both times.');return}
+  var st=new Date(+p[0],+p[1]-1,+p[2],+a[0],+a[1],0,0).getTime(),en=new Date(+p[0],+p[1]-1,+p[2],+z[0],+z[1],0,0).getTime();
+  if(en<st)en+=86400000;
+  if(en-st>12*3600000){toast('A break cannot be longer than 12 hours.');return}
+  guard('ed'+b.id,function(){
+    return fs.doc('breaks/'+b.id).update({start:st,end:en}).then(function(){editId=null;toast('Break updated.')});
   });
 }
 function deleteBreak(b){
@@ -277,7 +323,7 @@ function addStaff(){
 function bulkAdd(){
   var lines=bulkText.split(/\r?\n/).map(function(l){return l.trim()}).filter(Boolean);
   if(!lines.length){toast('Paste one staff per line: Name, username, PIN');return}
-  if(lines.length>50){toast('Add up to 50 at a time.');return}
+  if(lines.length>100){toast('Add up to 100 at a time.');return}
   guard('bulk',function(){
     var res=[],chain=Promise.resolve();
     lines.forEach(function(l){
@@ -304,13 +350,13 @@ function removeStaff(s){confirmId=null;guard('r'+s.id,function(){return fs.doc('
 function saveTypes(){
   var seen={},list=[];
   for(var i=0;i<typeDraft.length;i++){
-    var n=(typeDraft[i].name||'').trim(),m=Math.round(Number(typeDraft[i].allowed));
+    var n=(typeDraft[i].name||'').trim(),m=Math.round(Number(typeDraft[i].allowed)),mx=Math.max(0,Math.round(Number(typeDraft[i].max)||0));
     if(!n||!(m>0)){toast('Each break type needs a name and minutes above 0.');return}
     if(seen[n.toLowerCase()]){toast('Break type names must be different.');return}
-    seen[n.toLowerCase()]=1;list.push({name:n,allowed:m});
+    seen[n.toLowerCase()]=1;list.push({name:n,allowed:m,max:mx});
   }
   if(!list.length){toast('Keep at least one break type.');return}
-  guard('types',function(){return fs.doc('config/types').set({list:list}).then(function(){toast('Break types saved.')})});
+  guard('types',function(){var ao=Math.max(0,Math.round(Number(atOnceDraft)||0));return fs.doc('config/types').set({list:list,maxAtOnce:ao}).then(function(){toast('Break types saved.')})});
 }
 function doLogin(){
   var id=loginUser.trim().toLowerCase(),pw=loginPass;
@@ -337,7 +383,8 @@ function boardView(){
   var onNow=0,overNow=0;
   staff.forEach(function(s){var o=openFor(s.id);if(o&&o.start<=Date.now()){onNow++;if((Date.now()-o.start)/60000>o.allowed)overNow++}});
   if(staff.length&&isAdmin){
-    out.push(h('p',{class:'summary'},h('b',{},onNow),' on break now',overNow?[' · ',h('b',{},overNow),' over time']:''));
+    out.push(h('p',{class:'summary'},h('b',{},onNow),' on break now',maxAtOnce?(' of '+staff.length+' (limit '+maxAtOnce+')'):'',overNow?[' · ',h('b',{},overNow),' over time']:''));
+    if(maxAtOnce>0&&onNow>maxAtOnce)out.push(h('div',{class:'banner bad',role:'alert'},onNow+' staff are on break at once. The limit is '+maxAtOnce+'.'));
   }
   if(!staff.length){
     out.push(h('div',{class:'empty'},
@@ -418,7 +465,7 @@ function tick(){
     c.querySelector('.meter span').style.width=Math.min(100,lim>0?el/lim*100:100)+'%';
     var p=c.querySelector('[data-pill]');
     p.className='pill '+(state==='over'?'bad':state==='warn'?'warn':'on');
-    p.textContent=state==='over'?'Over time':'On break';
+    p.textContent=state==='over'?((el-lim)/60>=60?'Forgot to end?':'Over time'):'On break';
   });
 }
 
@@ -474,7 +521,22 @@ function reportView(){
       h('button',{class:'btn secondary small',type:'button',onclick:function(){setRange(today,today)}},'Today'),
       h('button',{class:'btn secondary small',type:'button',onclick:function(){setRange(dayKey(wk.getTime()),today)}},'This week'),
       h('button',{class:'btn secondary small',type:'button',onclick:function(){setRange(dayKey(ms.getTime()),today)}},'This month'),
+      h('button',{class:'btn secondary small',type:'button',onclick:function(){setRange('2000-01-01',today)}},'All time'),
       h('button',{class:'btn quiet small',type:'button',disabled:!list.length,onclick:function(){downloadCsv(list)}},'Download CSV'))));
+  var worst=rows.filter(function(r){return r.overMin>0}).sort(function(a,b){return b.overMin-a.overMin}).slice(0,3);
+  var maxTot=0;rows.forEach(function(r){if(r.tot>maxTot)maxTot=r.tot});
+  if(rows.length&&maxTot>0){
+    out.push(h('div',{class:'panel'},
+      h('h2',{},'Break minutes per person'),
+      h('div',{class:'bars'},rows.filter(function(r){return r.tot>0}).map(function(r){
+        return h('div',{class:'brow'},h('span',{},r.name),
+          h('div',{class:'bar',role:'img','aria-label':r.name+': '+r.tot+' minutes, '+r.overMin+' over time'},
+            h('i',{class:'a',style:'width:'+((r.tot-r.overMin)/maxTot*100)+'%'}),h('i',{class:'o',style:'width:'+(r.overMin/maxTot*100)+'%'})),
+          h('span',{},r.tot+' min'));
+      })),
+      h('div',{class:'legend'},h('span',{},h('b',{style:'background:var(--accent)'}),'Within allowed time'),h('span',{},h('b',{style:'background:var(--bad)'}),'Over time')),
+      worst.length?h('p',{class:'note'},'Needs attention: '+worst.map(function(r){return r.name+' ('+r.overMin+' min over, '+r.over+' break'+(r.over===1?'':'s')+')'}).join(' · ')):h('p',{class:'note'},'No over-time breaks in these dates.')));
+  }
   out.push(h('div',{class:'panel'},
     h('h2',{},'Per person'),
     h('div',{class:'tablewrap'},h('table',{},
@@ -489,10 +551,14 @@ function reportView(){
       :h('button',{class:'btn quiet small',type:'button',onclick:function(){confirmId=b.id;render()}},'Remove');
     return h('tr',{},
       h('td',{},prettyDay(dayKey(b.start))),h('td',{},nameOf(b)),h('td',{},b.type),
-      h('td',{},hm(b.start)+' – '+(open?'…':hm(b.end))),
+      editId===b.id
+        ?h('td',{},h('input',{type:'time',id:'ed-s',value:editStart,oninput:function(e){editStart=e.target.value}}),' – ',h('input',{type:'time',id:'ed-e',value:editEnd,oninput:function(e){editEnd=e.target.value}}))
+        :h('td',{},hm(b.start)+' – '+(open?'…':hm(b.end))),
       h('td',{class:'num'},open?'':dur(b)+' min'),
-      h('td',{},h('span',{class:'pill '+(open?'on':o>0?'bad':'ok')},open?'Open':o>0?('+'+o+' min'):'OK')),
-      h('td',{},open?h('button',{class:'btn secondary small',type:'button',onclick:function(){endBreak(b)}},'End now'):null,del));
+      h('td',{},h('span',{class:'pill '+(open?(forgot(b)?'bad':'on'):o>0?'bad':'ok')},open?(forgot(b)?'Forgot to end?':'Open'):o>0?('+'+o+' min'):'OK')),
+      h('td',{},open?h('button',{class:'btn secondary small',type:'button',onclick:function(){endBreak(b)}},'End now'):null,
+        (!open&&editId!==b.id)?h('button',{class:'btn secondary small',type:'button',onclick:function(){editId=b.id;editStart=hm24(b.start);editEnd=hm24(b.end);render()}},'Edit'):null,
+        editId===b.id?h('span',{class:'row'},h('button',{class:'btn small',type:'button',disabled:busy['ed'+b.id],onclick:function(){saveEdit(b)}},'Save'),h('button',{class:'btn quiet small',type:'button',onclick:function(){editId=null;render()}},'Cancel')):del));
   });
   out.push(h('div',{class:'panel'},
     h('h2',{},'Break log'),
@@ -549,18 +615,22 @@ function setupView(){
     h('p',{class:'note'},'One person per line: Name, username, PIN (6+ characters).'),
     h('label',{},'Staff list',h('textarea',{id:'bulk',rows:'6',autocapitalize:'none',spellcheck:'false',oninput:function(e){bulkText=e.target.value}},bulkText)),
     h('button',{class:'btn',type:'button',disabled:busy.bulk,onclick:bulkAdd},'Add all')));
-  if(!typeDraft)typeDraft=types.map(function(t){return{name:t.name,allowed:t.allowed}});
+  if(!typeDraft)typeDraft=types.map(function(t){return{name:t.name,allowed:t.allowed,max:t.max||0}});
+  if(atOnceDraft===null)atOnceDraft=maxAtOnce;
   out.push(h('div',{class:'panel'},
     h('h2',{},'Break types'),
-    h('p',{class:'note'},'Allowed minutes set when a break counts as over time. Changes apply to new breaks only.'),
+    h('p',{class:'note'},'Allowed minutes set when a break counts as over time. Max per day limits how many of that type one person can start in a day (0 = no limit). Changes apply to new breaks only.'),
+    h('div',{class:'typerow tr-lab'},h('span',{},'Name'),h('span',{},'Minutes'),h('span',{},'Max/day'),h('span',{})),
     h('div',{class:'list'},typeDraft.map(function(t,i){
       return h('div',{class:'item'},h('div',{class:'typerow',style:'flex:1'},
         h('input',{type:'text',id:'tn-'+i,value:t.name,maxlength:'30','aria-label':'Break type name',oninput:function(e){t.name=e.target.value}}),
         h('input',{type:'number',id:'tm-'+i,value:t.allowed,min:'1',max:'480',inputmode:'numeric','aria-label':'Allowed minutes',oninput:function(e){t.allowed=e.target.value}}),
+        h('input',{type:'number',id:'tx-'+i,value:t.max,min:'0',max:'20',inputmode:'numeric','aria-label':'Max per day',oninput:function(e){t.max=e.target.value}}),
         h('button',{class:'btn quiet small',type:'button',onclick:function(){typeDraft.splice(i,1);render()}},'Remove')));
     })),
+    h('label',{},'Most staff allowed on break at the same time (0 = no limit). The admin board warns when this is exceeded.',h('input',{type:'number',id:'at-once',min:'0',max:'100',inputmode:'numeric',value:atOnceDraft,oninput:function(e){atOnceDraft=e.target.value}})),
     h('div',{class:'row'},
-      h('button',{class:'btn secondary',type:'button',onclick:function(){typeDraft.push({name:'',allowed:10});render()}},'Add type'),
+      h('button',{class:'btn secondary',type:'button',onclick:function(){typeDraft.push({name:'',allowed:10,max:0});render()}},'Add type'),
       h('button',{class:'btn',type:'button',disabled:busy.types,onclick:saveTypes},'Save types'))));
   return out;
 }
@@ -590,7 +660,7 @@ function needSetupView(){
 }
 
 /* ---------- shell ---------- */
-function go(t){tab=t;picking=null;customFor=null;startAt='';confirmId=null;if(t==='setup')typeDraft=null;render()}
+function go(t){tab=t;picking=null;customFor=null;startAt='';confirmId=null;editId=null;if(t==='setup'){typeDraft=null;atOnceDraft=null}render()}
 function render(){
   var ae=document.activeElement,keep=null;
   if(ae&&ae.id&&app.contains(ae)&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA')){keep={id:ae.id,v:ae.value,s:ae.selectionStart,e:ae.selectionEnd}}
@@ -604,6 +674,7 @@ function render(){
     right.push(h('button',{class:'btn quiet small',type:'button',onclick:function(){showPin=!showPin;render()}},'Change PIN'));
     right.push(h('button',{class:'btn quiet small',type:'button',onclick:doLogout},'Sign out'));
   }
+  right.push(h('button',{class:'btn quiet small',type:'button',id:'theme-btn','aria-label':'Change theme',onclick:cycleTheme},theme==='auto'?'Theme: Auto':theme==='light'?'Theme: Light':'Theme: Dark'));
   var who=user&&!isAdmin&&staff.length?staff[0].name:'';
   var kids=[h('header',{},
     h('div',{},h('h1',{},'Break Board'),h('p',{class:'tagline'},'Great service starts with well-rested people.'),h('p',{class:'date'},(who?who+' · ':'')+new Date().toLocaleDateString([], {weekday:'long',day:'numeric',month:'long'})+' · ',h('span',{class:'clk',id:'now-clock'},''))),
@@ -622,8 +693,8 @@ function render(){
     kids=kids.concat(tab==='board'?boardView():tab==='report'?reportView():setupView());
   }
   if(popup&&user)kids.push(h('div',{class:'modal-back'},h('div',{class:'modal',role:'alertdialog','aria-modal':'true','aria-label':'Over time reminder'},
-    h('h2',{},'Break over time'),
-    h('ul',{},popup.slice(-6).map(function(m){return h('li',{},m)})),
+    h('h2',{},popup.over?'Break over time':'Break ending soon'),
+    h('ul',{},popup.items.slice(-6).map(function(m){return h('li',{},m)})),
     h('button',{class:'btn wide',type:'button',id:'popup-ok',onclick:function(){popup=null;render()}},'OK'))));
   if(toastMsg)kids.push(h('div',{class:'toast',role:'status'},toastMsg));
   app.replaceChildren.apply(app,kids);
@@ -642,8 +713,9 @@ function mapBreak(d){var x=d.data()||{};return{id:d.id,staffId:x.staffId,staffNa
 function typesSub(){
   return fs.doc('config/types').onSnapshot(function(snap){
     var x=snap.exists?snap.data():null;
-    types=(x&&Array.isArray(x.list)&&x.list.length)?x.list.map(function(t){return{name:String(t.name),allowed:Number(t.allowed)||10}}):DEFAULT_TYPES.slice();
-    if(tab!=='setup')typeDraft=null;
+    types=(x&&Array.isArray(x.list)&&x.list.length)?x.list.map(function(t){return{name:String(t.name),allowed:Number(t.allowed)||10,max:Math.max(0,Number(t.max)||0)}}):DEFAULT_TYPES.slice();
+    maxAtOnce=Math.max(0,Number(x&&x.maxAtOnce)||0);
+    if(tab!=='setup'){typeDraft=null;atOnceDraft=null}
     render();
   },fail);
 }
@@ -676,7 +748,7 @@ function startStaff(){
     live=snap.exists?[mapLive(snap.id,snap.data()||{})]:[];
     got.live=true;clearTimeout(loadTimer);slow=false;dbErr='';render();
   },fail));
-  subs.push(fs.collection('breaks').where('email','==',myEmail).limit(300).onSnapshot(function(snap){
+  subs.push(fs.collection('breaks').where('email','==',myEmail).limit(1000).onSnapshot(function(snap){
     breaks=snap.docs.map(mapBreak).sort(function(a,b){return b.start-a.start});render();
   },fail));
   subs.push(typesSub());
@@ -691,6 +763,7 @@ function onAuth(u){
   render();
 }
 function init(){
+  loadTheme();
   render();
   if(configured){
     try{
