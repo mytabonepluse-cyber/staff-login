@@ -103,6 +103,15 @@ tr.total td{font-weight:600;border-bottom:0;background:var(--bg)}
 .typerow{display:grid;grid-template-columns:minmax(0,1fr) 96px auto;gap:8px;align-items:center}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:8px;font-weight:500;max-width:calc(100vw - 32px);z-index:20}
 @media (prefers-reduced-motion:reduce){.meter span{transition:none}}
+.tagline{margin:2px 0 6px;font-size:.95rem;font-weight:500;color:var(--accent,#0f7d7a);letter-spacing:.01em}
+.modal-back{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:50}
+.modal{background:var(--surface);color:var(--ink);border:2px solid var(--bad);border-radius:14px;max-width:420px;width:100%;padding:20px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.modal h2{margin:0 0 8px;color:var(--bad);font-size:1.25rem}
+.modal ul{margin:0 0 16px;padding-left:20px}
+.modal li{margin:4px 0}
+.cred{background:var(--ok-bg);border:1px solid var(--ok);border-radius:10px;padding:12px 14px;margin:0 0 12px}
+.cred b{font-family:var(--font-mono)}
+textarea{font:inherit;font-family:var(--font-mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;width:100%;box-sizing:border-box;min-height:120px}
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -116,15 +125,23 @@ tr.total td{font-weight:600;border-bottom:0;background:var(--bg)}
 (function(){
 'use strict';
 var DEFAULT_TYPES=[{name:'Lunch',allowed:30},{name:'Tea / Coffee',allowed:15},{name:'Other',allowed:10}];
+var CONF=window.BREAK_BOARD_CONFIG||{};
+var cfg=CONF.firebase||{};
+var DOMAIN=(CONF.emailDomain||'breakboard.example.com').toLowerCase();
+var ADMIN_EMAILS=(CONF.adminEmails||['mytabonepluse@gmail.com']).map(function(e){return String(e).toLowerCase()});
 var app=document.getElementById('app');
-var cfg=(window.BREAK_BOARD_CONFIG||{}).firebase||{};
 var configured=!!(cfg.apiKey&&String(cfg.apiKey).indexOf('PASTE')!==0&&cfg.projectId&&String(cfg.projectId).indexOf('PASTE')!==0);
-var fs=null,auth=null,isAdmin=false,dbErr='',slow=false;
+var fs=null,auth=null;
+var user=null,isAdmin=false,me=null,myEmail='',authReady=false;
+var dbErr='',slow=false;
 var staff=[],types=DEFAULT_TYPES.slice(),live=[],breaks=[];
 var got={staff:false,live:false};
+var subs=[];
 var tab='board',picking=null,customFor=null,customMin='',startAt='',busy={},confirmId=null,typeDraft=null;
-var toastMsg='',toastTimer=null,loadTimer=null,unsubBreaks=null;
-var showLogin=false,loginErr='',loginEmail='',loginPass='';
+var toastMsg='',toastTimer=null,loadTimer=null;
+var loginUser='',loginPass='',loginErr='';
+var showPin=false,newPin='';var bulkText='',bulkRes=null,popup=null,alerted={},newCred=null,audioCtx=null;
+var addName='',addUser='',addPin='';
 var today=dayKey(Date.now());
 var range={from:today,to:today};
 
@@ -152,16 +169,55 @@ function h(tag,attrs){
   }
   return e;
 }
-function toast(m){toastMsg=m;clearTimeout(toastTimer);toastTimer=setTimeout(function(){toastMsg='';render()},3500);render()}
+function toast(m){toastMsg=m;clearTimeout(toastTimer);toastTimer=setTimeout(function(){toastMsg='';render()},4500);render()}
 function errMsg(e){
   var c=e&&e.code;
   if(c==='permission-denied')return 'Not allowed. Check the database rules.';
   if(c==='unavailable')return 'No connection. Try again.';
+  if(c==='auth/email-already-in-use')return 'That username already has a login. Pick another, or delete it in Firebase first.';
+  if(c==='auth/weak-password')return 'The PIN must be at least 6 characters.';
+  if(c==='auth/requires-recent-login')return 'Sign out, sign in again, then change the PIN.';
+  if(c==='auth/network-request-failed')return 'No connection. Try again.';
   return 'Something went wrong. Try again.';
 }
 function openFor(id){for(var i=0;i<live.length;i++){if(live[i].staffId===id)return live[i]}return null}
 function todayStats(id){var n=0,t=0;breaks.forEach(function(b){if(b.staffId===id&&dayKey(b.start)===today){n++;t+=dur(b)}});return{n:n,t:t}}
 function nameOf(b){for(var i=0;i<staff.length;i++){if(staff[i].id===b.staffId)return staff[i].name}return b.staffName||'Removed staff'}
+function emailFor(id){return id+'@'+DOMAIN}
+
+/* ---------- over-time reminders ---------- */
+function beep(){
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+    audioCtx=audioCtx||new AC();if(audioCtx.state==='suspended')audioCtx.resume();
+    [0,0.35,0.7].forEach(function(t){
+      var o=audioCtx.createOscillator(),g=audioCtx.createGain();
+      o.type='sine';o.frequency.value=880;g.gain.value=0.15;
+      o.connect(g);g.connect(audioCtx.destination);
+      o.start(audioCtx.currentTime+t);o.stop(audioCtx.currentTime+t+0.2);
+    });
+  }catch(e){}
+  try{if(navigator.vibrate)navigator.vibrate([300,150,300])}catch(e){}
+}
+function checkAlerts(){
+  if(!user||!authReady)return;
+  var now=Date.now(),fresh=[];
+  live.forEach(function(o){
+    if(o.start>now)return;
+    var over=now-o.start-o.allowed*60000;
+    if(over<0)return;
+    var key=o.id+':'+o.start,last=alerted[key];
+    if(last&&now-last<5*60000)return;
+    alerted[key]=now;
+    var mins=Math.max(1,Math.floor(over/60000));
+    var who=nameOf(o);
+    fresh.push(isAdmin?(who+' is over time on '+o.type+' (over by '+(over<60000?'under 1':mins)+' min).')
+      :('Your '+o.type+' break is over time (over by '+(over<60000?'under 1':mins)+' min). Please end your break.'));
+  });
+  if(!fresh.length)return;
+  popup=(popup||[]).concat(fresh);
+  beep();render();
+}
 
 /* ---------- actions ---------- */
 function guard(key,fn){
@@ -188,7 +244,7 @@ function endBreak(b){
   guard('e'+b.id,function(){
     var end=Math.max(Date.now(),b.start);
     var batch=fs.batch();
-    batch.set(fs.collection('breaks').doc(),{staffId:b.staffId,staffName:b.staffName||'',type:b.type,allowed:b.allowed,start:b.start,end:end});
+    batch.set(fs.collection('breaks').doc(),{staffId:b.staffId,staffName:b.staffName||'',email:emailFor(b.staffId),type:b.type,allowed:b.allowed,start:b.start,end:end});
     batch.delete(fs.collection('live').doc(b.id));
     return batch.commit().then(function(){toast('Break recorded for '+nameOf(b)+'.')});
   });
@@ -197,10 +253,53 @@ function deleteBreak(b){
   confirmId=null;
   guard('d'+b.id,function(){return fs.doc((b.live?'live/':'breaks/')+b.id).delete()});
 }
-function addStaff(name){
-  name=name.trim();if(!name)return;
-  guard('addstaff',function(){return fs.collection('staff').add({name:name.slice(0,60),order:Date.now()})});
+function createLogin(username,pin){
+  var sec;
+  try{sec=firebase.app('secondary')}catch(e){sec=firebase.initializeApp(cfg,'secondary')}
+  var a=sec.auth();
+  return a.createUserWithEmailAndPassword(emailFor(username),pin).then(function(){return a.signOut()});
 }
+function addStaff(){
+  var name=addName.trim().slice(0,60),un=addUser.trim().toLowerCase(),pin=addPin.trim();
+  if(!name){toast('Enter the staff name.');return}
+  if(!/^[a-z0-9._-]{2,30}$/.test(un)){toast('Username: 2 to 30 letters or numbers, no spaces.');return}
+  if(pin.length<6){toast('The PIN must be at least 6 characters.');return}
+  var existing=null;staff.forEach(function(s){if(s.id===un)existing=s});
+  guard('addstaff',function(){
+    return createLogin(un,pin).then(function(){
+      return fs.doc('staff/'+un).set({name:name,username:un,order:existing?existing.order:Date.now()},{merge:true});
+    }).then(function(){
+      newCred={name:name,username:un,pin:pin};
+      addName='';addUser='';addPin='';
+    });
+  });
+}
+function bulkAdd(){
+  var lines=bulkText.split(/\r?\n/).map(function(l){return l.trim()}).filter(Boolean);
+  if(!lines.length){toast('Paste one staff per line: Name, username, PIN');return}
+  if(lines.length>50){toast('Add up to 50 at a time.');return}
+  guard('bulk',function(){
+    var res=[],chain=Promise.resolve();
+    lines.forEach(function(l){
+      chain=chain.then(function(){
+        var p=l.split(',').map(function(x){return x.trim()});
+        var name=(p[0]||'').slice(0,60),un=(p[1]||'').toLowerCase(),pin=p[2]||'';
+        if(!name||!/^[a-z0-9._-]{2,30}$/.test(un)||pin.length<6){res.push({name:name||l,username:un,pin:pin,ok:false,err:'Check the line format'});return}
+        return createLogin(un,pin).then(function(){
+          return fs.doc('staff/'+un).set({name:name,username:un,order:Date.now()+res.length},{merge:true});
+        }).then(function(){res.push({name:name,username:un,pin:pin,ok:true})},
+          function(e){res.push({name:name,username:un,pin:pin,ok:false,err:errMsg(e)})});
+      });
+    });
+    return chain.then(function(){
+      bulkRes=res;
+      var bad=res.filter(function(r){return !r.ok}).length;
+      bulkText=res.filter(function(r){return !r.ok}).map(function(r){return r.name+', '+r.username+', '+r.pin}).join('\n');
+      toast(bad?(res.length-bad)+' added, '+bad+' not added.':'All '+res.length+' staff added.');
+    });
+  });
+}
+function genPin(){addPin=String(Math.floor(100000+Math.random()*900000));render()}
 function removeStaff(s){confirmId=null;guard('r'+s.id,function(){return fs.doc('staff/'+s.id).delete()})}
 function saveTypes(){
   var seen={},list=[];
@@ -214,13 +313,23 @@ function saveTypes(){
   guard('types',function(){return fs.doc('config/types').set({list:list}).then(function(){toast('Break types saved.')})});
 }
 function doLogin(){
-  var em=loginEmail.trim(),pw=loginPass;
-  if(!em||!pw){loginErr='Enter your email and password.';render();return}
+  var id=loginUser.trim().toLowerCase(),pw=loginPass;
+  if(!id||!pw){loginErr='Enter your username and PIN.';render();return}
+  var email=id.indexOf('@')>-1?id:emailFor(id);
   guard('login',function(){
-    return auth.signInWithEmailAndPassword(em,pw).then(function(){showLogin=false;loginErr='';loginPass=''}).catch(function(){loginErr='Wrong email or password.'});
+    return auth.signInWithEmailAndPassword(email,pw).then(function(){loginErr='';loginPass=''}).catch(function(e){
+      loginErr=(e&&e.code==='auth/network-request-failed')?'No connection. Try again.':'Wrong username or PIN.';
+    });
   });
 }
-function doLogout(){tab='board';auth.signOut()}
+function doLogout(){tab='board';showPin=false;newPin='';auth.signOut()}
+function changePin(){
+  var p=newPin.trim();
+  if(p.length<6){toast('The PIN must be at least 6 characters.');return}
+  guard('pin',function(){
+    return auth.currentUser.updatePassword(p).then(function(){showPin=false;newPin='';toast('PIN changed.')});
+  });
+}
 
 /* ---------- board ---------- */
 function boardView(){
@@ -232,8 +341,8 @@ function boardView(){
   }
   if(!staff.length){
     out.push(h('div',{class:'empty'},
-      h('strong',{},got.staff?'No staff on the board yet':'Loading staff…'),
-      got.staff?h('span',{},isAdmin?'Add your team to start tracking breaks.':'The admin needs to add staff names first.'):null,
+      h('strong',{},got.staff?(isAdmin?'No staff on the board yet':'Your name is not on the board'):'Loading…'),
+      got.staff?h('span',{},isAdmin?'Add your team in Setup. Each person gets a username and PIN.':'Ask the admin to add you.'):null,
       got.staff&&isAdmin?h('button',{class:'btn',type:'button',onclick:function(){go('setup')}},'Add staff'):null));
     return out;
   }
@@ -254,7 +363,7 @@ function card(s){
       h('p',{class:'sub'},h('span',{class:'info'},''),h('span',{class:'left'},'')),
       h('button',{class:'btn wide act',type:'button',disabled:busy['e'+o.id]||busy['d'+o.id],onclick:function(){if(Date.now()<o.start)deleteBreak(o);else endBreak(o)}},'End break'));
   }else{
-    if(isAdmin)c.append(h('p',{class:'today'},st.n?('Today · '+st.n+(st.n===1?' break':' breaks')+' · '+st.t+' min'):'No breaks yet today'));
+    c.append(h('p',{class:'today'},st.n?('Today · '+st.n+(st.n===1?' break':' breaks')+' · '+st.t+' min'):'No breaks yet today'));
     if(picking===s.id){
       c.append(h('label',{},'Start at (empty = start now)',h('input',{type:'time',id:'st-'+s.id,value:startAt,oninput:function(e){startAt=e.target.value}})));
       var chips=types.map(function(t){
@@ -397,16 +506,49 @@ function reportView(){
 /* ---------- setup (admin) ---------- */
 function setupView(){
   var out=[];
-  var nameIn=h('input',{type:'text',id:'new-staff',maxlength:'60',placeholder:'Full name',autocomplete:'off'});
-  out.push(h('form',{class:'panel',onsubmit:function(e){e.preventDefault();addStaff(nameIn.value);nameIn.value=''}},
-    h('h2',{},'Staff'),
-    h('div',{class:'row'},h('label',{style:'flex:1 1 200px'},'Add a person',nameIn),h('button',{class:'btn',type:'submit',disabled:busy.addstaff},'Add')),
+  if(newCred){
+    var txt='Break Board login\nUsername: '+newCred.username+'\nPIN: '+newCred.pin;
+    out.push(h('div',{class:'cred',role:'status'},
+      h('strong',{},'Login created for '+newCred.name),
+      h('p',{},'Username: ',h('b',{},newCred.username),'   PIN: ',h('b',{},newCred.pin)),
+      h('p',{class:'note'},'Send these to the staff member now. The PIN is not shown again. They can change it after signing in.'),
+      h('div',{class:'row'},
+        h('button',{class:'btn secondary small',type:'button',onclick:function(){
+          try{navigator.clipboard.writeText(txt).then(function(){toast('Copied.')},function(){toast('Could not copy. Select the text instead.')})}catch(e){toast('Could not copy. Select the text instead.')}}},'Copy'),
+        h('button',{class:'btn quiet small',type:'button',onclick:function(){newCred=null;render()}},'Done'))));
+  }
+  if(bulkRes){
+    var ctxt='Break Board logins\n'+bulkRes.filter(function(r){return r.ok}).map(function(r){return r.name+' - username: '+r.username+'  PIN: '+r.pin}).join('\n');
+    out.push(h('div',{class:'cred',role:'status'},
+      h('strong',{},'Bulk add result'),
+      h('div',{class:'list'},bulkRes.map(function(r){return h('div',{class:'item'},h('span',{},(r.ok?'Added: ':'Not added: ')+r.name+' · ',h('b',{},r.username),'  ',h('b',{},r.pin),r.ok?'':' ('+r.err+')'))})),
+      h('p',{class:'note'},'Send each person their username and PIN. PINs are not shown again after you tap Done.'),
+      h('div',{class:'row'},
+        h('button',{class:'btn secondary small',type:'button',onclick:function(){
+          try{navigator.clipboard.writeText(ctxt).then(function(){toast('Copied.')},function(){toast('Could not copy.')})}catch(e){toast('Could not copy.')}}},'Copy all'),
+        h('button',{class:'btn quiet small',type:'button',onclick:function(){bulkRes=null;render()}},'Done'))));
+  }
+  out.push(h('form',{class:'panel',onsubmit:function(e){e.preventDefault();addStaff()}},
+    h('h2',{},'Staff logins'),
+    h('p',{class:'note'},'Each person signs in with a username and PIN. Give them these two things. They can change their PIN after signing in.'),
+    h('div',{class:'row'},
+      h('label',{style:'flex:1 1 150px'},'Name',h('input',{type:'text',id:'add-name',maxlength:'60',autocomplete:'off',value:addName,oninput:function(e){addName=e.target.value}})),
+      h('label',{style:'flex:1 1 120px'},'Username',h('input',{type:'text',id:'add-user',maxlength:'30',autocomplete:'off',autocapitalize:'none',value:addUser,oninput:function(e){addUser=e.target.value}})),
+      h('label',{style:'flex:1 1 110px'},'PIN (6+ characters)',h('input',{type:'text',id:'add-pin',maxlength:'30',autocomplete:'off',inputmode:'numeric',value:addPin,oninput:function(e){addPin=e.target.value}})),
+      h('button',{class:'btn secondary',type:'button',onclick:genPin},'Generate PIN'),
+      h('button',{class:'btn',type:'submit',disabled:busy.addstaff},'Add')),
     staff.length?h('div',{class:'list'},staff.map(function(s){
-      return h('div',{class:'item'},h('span',{},s.name),
+      return h('div',{class:'item'},h('span',{},s.name+' · ',h('span',{class:'note'},s.id)),
         confirmId==='st'+s.id
           ?h('span',{class:'row'},h('button',{class:'btn danger small',type:'button',onclick:function(){removeStaff(s)}},'Remove'),h('button',{class:'btn quiet small',type:'button',onclick:function(){confirmId=null;render()}},'Keep'))
           :h('button',{class:'btn quiet small',type:'button',onclick:function(){confirmId='st'+s.id;render()}},'Remove'));
-    })):h('p',{class:'note'},'No staff yet. Removing a person keeps their past breaks in the log.')));
+    })):h('p',{class:'note'},'No staff yet.'),
+    h('p',{class:'note'},'Removing a person stops them using the board and keeps their past breaks. To reuse a username or reset a forgotten PIN, delete that user in Firebase (Authentication → Users), then add the person here again with the same username.')));
+  out.push(h('div',{class:'panel'},
+    h('h2',{},'Add many staff at once'),
+    h('p',{class:'note'},'One person per line: Name, username, PIN (6+ characters).'),
+    h('label',{},'Staff list',h('textarea',{id:'bulk',rows:'6',autocapitalize:'none',spellcheck:'false',oninput:function(e){bulkText=e.target.value}},bulkText)),
+    h('button',{class:'btn',type:'button',disabled:busy.bulk,onclick:bulkAdd},'Add all')));
   if(!typeDraft)typeDraft=types.map(function(t){return{name:t.name,allowed:t.allowed}});
   out.push(h('div',{class:'panel'},
     h('h2',{},'Break types'),
@@ -423,16 +565,23 @@ function setupView(){
   return out;
 }
 
-/* ---------- login + setup-needed ---------- */
+/* ---------- login, pin, setup-needed ---------- */
 function loginView(){
   return h('form',{class:'panel narrow',onsubmit:function(e){e.preventDefault();doLogin()}},
-    h('h2',{},'Admin login'),
-    h('label',{},'Email',h('input',{type:'email',id:'a-email',autocomplete:'username',value:loginEmail,oninput:function(e){loginEmail=e.target.value}})),
-    h('label',{},'Password',h('input',{type:'password',id:'a-pass',autocomplete:'current-password',value:loginPass,oninput:function(e){loginPass=e.target.value}})),
+    h('h2',{},'Sign in'),
+    h('p',{class:'note'},'Staff: your username and PIN. Admin: your email and password.'),
+    h('label',{},'Username or email',h('input',{type:'text',id:'l-user',autocomplete:'username',autocapitalize:'none',value:loginUser,oninput:function(e){loginUser=e.target.value}})),
+    h('label',{},'PIN or password',h('input',{type:'password',id:'l-pass',autocomplete:'current-password',value:loginPass,oninput:function(e){loginPass=e.target.value}})),
     loginErr?h('p',{class:'err',role:'alert'},loginErr):null,
+    h('button',{class:'btn',type:'submit',disabled:busy.login},'Sign in'));
+}
+function pinView(){
+  return h('form',{class:'panel narrow',onsubmit:function(e){e.preventDefault();changePin()}},
+    h('h2',{},'Change PIN'),
+    h('label',{},'New PIN (6+ characters)',h('input',{type:'password',id:'new-pin',autocomplete:'new-password',value:newPin,oninput:function(e){newPin=e.target.value}})),
     h('div',{class:'row'},
-      h('button',{class:'btn',type:'submit',disabled:busy.login},'Sign in'),
-      h('button',{class:'btn quiet',type:'button',onclick:function(){showLogin=false;loginErr='';render()}},'Cancel')));
+      h('button',{class:'btn',type:'submit',disabled:busy.pin},'Save PIN'),
+      h('button',{class:'btn quiet',type:'button',onclick:function(){showPin=false;newPin='';render()}},'Cancel')));
 }
 function needSetupView(){
   return h('div',{class:'empty'},
@@ -444,28 +593,38 @@ function needSetupView(){
 function go(t){tab=t;picking=null;customFor=null;startAt='';confirmId=null;if(t==='setup')typeDraft=null;render()}
 function render(){
   var ae=document.activeElement,keep=null;
-  if(ae&&ae.id&&app.contains(ae)&&ae.tagName==='INPUT'){keep={id:ae.id,v:ae.value,s:ae.selectionStart,e:ae.selectionEnd}}
+  if(ae&&ae.id&&app.contains(ae)&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA')){keep={id:ae.id,v:ae.value,s:ae.selectionStart,e:ae.selectionEnd}}
   if(!isAdmin&&tab!=='board')tab='board';
   var tabs=[['board','Board'],['report','Report'],['setup','Setup']];
   var right=[];
-  if(isAdmin){
+  if(user&&isAdmin){
     right.push(h('nav',{class:'tabs','aria-label':'Sections'},tabs.map(function(t){return h('button',{class:'tab',type:'button','aria-pressed':String(tab===t[0]),onclick:function(){go(t[0])}},t[1])})));
     right.push(h('button',{class:'btn quiet small',type:'button',onclick:doLogout},'Sign out'));
-  }else if(configured&&auth&&!showLogin){
-    right.push(h('button',{class:'btn quiet small',type:'button',onclick:function(){showLogin=true;render()}},'Admin login'));
+  }else if(user){
+    right.push(h('button',{class:'btn quiet small',type:'button',onclick:function(){showPin=!showPin;render()}},'Change PIN'));
+    right.push(h('button',{class:'btn quiet small',type:'button',onclick:doLogout},'Sign out'));
   }
+  var who=user&&!isAdmin&&staff.length?staff[0].name:'';
   var kids=[h('header',{},
-    h('div',{},h('h1',{},'Break Board'),h('p',{class:'date'},new Date().toLocaleDateString([], {weekday:'long',day:'numeric',month:'long'})+' · ',h('span',{class:'clk',id:'now-clock'},''))),
+    h('div',{},h('h1',{},'Break Board'),h('p',{class:'tagline'},'Great service starts with well-rested people.'),h('p',{class:'date'},(who?who+' · ':'')+new Date().toLocaleDateString([], {weekday:'long',day:'numeric',month:'long'})+' · ',h('span',{class:'clk',id:'now-clock'},''))),
     h('div',{class:'hright'},right))];
   if(!configured){
     kids.push(needSetupView());
+  }else if(!authReady){
+    kids.push(h('p',{class:'note'},'Loading…'));
+  }else if(!user){
+    kids.push(loginView());
   }else{
-    if(dbErr==='permission-denied')kids.push(h('div',{class:'banner bad'},'The database rules are not published yet. Follow step 3 in README.md.'));
+    if(dbErr==='permission-denied')kids.push(h('div',{class:'banner bad'},'The database rules are missing or out of date. Follow step 3 in README.md.'));
     else if(dbErr)kids.push(h('div',{class:'banner bad'},'Cannot reach the database. Check your internet and the settings in config.js.'));
     else if(slow&&!(got.staff&&got.live))kids.push(h('div',{class:'banner'},"Can't reach the saved data yet. This page keeps trying."));
-    if(showLogin&&!isAdmin)kids.push(loginView());
-    else kids=kids.concat(tab==='board'?boardView():tab==='report'?reportView():setupView());
+    if(showPin&&!isAdmin)kids.push(pinView());
+    kids=kids.concat(tab==='board'?boardView():tab==='report'?reportView():setupView());
   }
+  if(popup&&user)kids.push(h('div',{class:'modal-back'},h('div',{class:'modal',role:'alertdialog','aria-modal':'true','aria-label':'Over time reminder'},
+    h('h2',{},'Break over time'),
+    h('ul',{},popup.slice(-6).map(function(m){return h('li',{},m)})),
+    h('button',{class:'btn wide',type:'button',id:'popup-ok',onclick:function(){popup=null;render()}},'OK'))));
   if(toastMsg)kids.push(h('div',{class:'toast',role:'status'},toastMsg));
   app.replaceChildren.apply(app,kids);
   if(keep){var el=document.getElementById(keep.id);if(el){el.value=keep.v;el.focus();try{el.setSelectionRange(keep.s,keep.e)}catch(x){}}}
@@ -473,41 +632,63 @@ function render(){
 }
 
 /* ---------- data ---------- */
-function startData(){
-  loadTimer=setTimeout(function(){slow=true;render()},10000);
-  function fail(e){dbErr=(e&&e.code)||'error';render()}
-  fs.collection('staff').onSnapshot(function(snap){
-    staff=snap.docs.map(function(d){var x=d.data()||{};return{id:d.id,name:String(x.name||'Unnamed'),order:Number(x.order)||0}})
-      .sort(function(a,b){return a.order-b.order||a.name.localeCompare(b.name)});
-    got.staff=true;dbErr='';render();
-  },fail);
-  fs.doc('config/types').onSnapshot(function(snap){
+function stopAll(){
+  subs.forEach(function(u){try{u()}catch(e){}});subs=[];
+  staff=[];live=[];breaks=[];got={staff:false,live:false};dbErr='';slow=false;clearTimeout(loadTimer);
+}
+function fail(e){dbErr=(e&&e.code)||'error';render()}
+function mapLive(id,x){return{id:id,live:true,staffId:x.staffId||id,staffName:x.staffName,type:String(x.type||''),allowed:Number(x.allowed)||0,start:Number(x.start)||0,end:null}}
+function mapBreak(d){var x=d.data()||{};return{id:d.id,staffId:x.staffId,staffName:x.staffName,type:String(x.type||''),allowed:Number(x.allowed)||0,start:Number(x.start)||0,end:Number(x.end)||0}}
+function typesSub(){
+  return fs.doc('config/types').onSnapshot(function(snap){
     var x=snap.exists?snap.data():null;
     types=(x&&Array.isArray(x.list)&&x.list.length)?x.list.map(function(t){return{name:String(t.name),allowed:Number(t.allowed)||10}}):DEFAULT_TYPES.slice();
     if(tab!=='setup')typeDraft=null;
     render();
   },fail);
-  fs.collection('live').onSnapshot(function(snap){
-    live=snap.docs.map(function(d){var x=d.data()||{};return{id:d.id,live:true,staffId:x.staffId||d.id,staffName:x.staffName,type:String(x.type||''),allowed:Number(x.allowed)||0,start:Number(x.start)||0,end:null}});
+}
+function startAdmin(){
+  stopAll();
+  loadTimer=setTimeout(function(){slow=true;render()},10000);
+  subs.push(fs.collection('staff').onSnapshot(function(snap){
+    staff=snap.docs.map(function(d){var x=d.data()||{};return{id:d.id,name:String(x.name||d.id),order:Number(x.order)||0}})
+      .sort(function(a,b){return a.order-b.order||a.name.localeCompare(b.name)});
+    got.staff=true;dbErr='';render();
+  },fail));
+  subs.push(fs.collection('live').onSnapshot(function(snap){
+    live=snap.docs.map(function(d){return mapLive(d.id,d.data()||{})});
     got.live=true;clearTimeout(loadTimer);slow=false;dbErr='';render();
-  },fail);
-  auth.onAuthStateChanged(function(u){
-    isAdmin=!!u;
-    if(isAdmin&&!unsubBreaks){
-      unsubBreaks=fs.collection('breaks').orderBy('start','desc').limit(1000).onSnapshot(function(snap){
-        breaks=snap.docs.map(function(d){var x=d.data()||{};return{id:d.id,staffId:x.staffId,staffName:x.staffName,type:String(x.type||''),allowed:Number(x.allowed)||0,start:Number(x.start)||0,end:Number(x.end)||0}});
-        render();
-      },function(e){
-        if(e&&e.code==='permission-denied'){toast('This account is not an admin.');auth.signOut()}
-        else{dbErr=(e&&e.code)||'error';render()}
-      });
-    }
-    if(!isAdmin){
-      if(unsubBreaks){unsubBreaks();unsubBreaks=null}
-      breaks=[];tab='board';
-    }
-    render();
-  });
+  },fail));
+  subs.push(fs.collection('breaks').orderBy('start','desc').limit(1000).onSnapshot(function(snap){
+    breaks=snap.docs.map(mapBreak);render();
+  },fail));
+  subs.push(typesSub());
+}
+function startStaff(){
+  stopAll();
+  loadTimer=setTimeout(function(){slow=true;render()},10000);
+  subs.push(fs.doc('staff/'+me).onSnapshot(function(snap){
+    var x=snap.exists?snap.data():null;
+    staff=x?[{id:me,name:String(x.name||me),order:0}]:[];
+    got.staff=true;dbErr='';render();
+  },fail));
+  subs.push(fs.doc('live/'+me).onSnapshot(function(snap){
+    live=snap.exists?[mapLive(snap.id,snap.data()||{})]:[];
+    got.live=true;clearTimeout(loadTimer);slow=false;dbErr='';render();
+  },fail));
+  subs.push(fs.collection('breaks').where('email','==',myEmail).limit(300).onSnapshot(function(snap){
+    breaks=snap.docs.map(mapBreak).sort(function(a,b){return b.start-a.start});render();
+  },fail));
+  subs.push(typesSub());
+}
+function onAuth(u){
+  authReady=true;user=u;isAdmin=false;me=null;myEmail='';toastMsg='';popup=null;newCred=null;bulkRes=null;bulkText='';alerted={};popup=null;newCred=null;alerted={};
+  if(!u){stopAll();render();return}
+  myEmail=String(u.email||'').toLowerCase();
+  if(ADMIN_EMAILS.indexOf(myEmail)>-1){isAdmin=true;startAdmin()}
+  else if(myEmail.slice(-(DOMAIN.length+1))==='@'+DOMAIN){me=myEmail.slice(0,-(DOMAIN.length+1));startStaff()}
+  else{toast('This account is not set up for Break Board.');auth.signOut();return}
+  render();
 }
 function init(){
   render();
@@ -516,10 +697,10 @@ function init(){
       if(typeof firebase==='undefined')throw new Error('Firebase did not load');
       firebase.initializeApp(cfg);
       fs=firebase.firestore();auth=firebase.auth();
-      startData();
-    }catch(e){dbErr='error';render()}
+      auth.onAuthStateChanged(onAuth);
+    }catch(e){authReady=true;dbErr='error';render()}
   }
-  setInterval(tick,1000);
+  setInterval(function(){tick();checkAlerts()},1000);
 }
 init();
 })();
